@@ -31,67 +31,139 @@ enum DownloadState {
     case failed(error: String)
 }
 
+enum VideoService: String, CaseIterable, Identifiable {
+    case youtube = "YouTube"
+    case tiktok = "TikTok"
+    var id: String { rawValue }
+}
+
 // MARK: - Download Manager
 class DownloadManager: ObservableObject {
     @Published var downloadState: DownloadState = .idle
     @Published var downloadedFileURL: URL?
     
     // Адрес сервера для скачивания
-    private let serverURL = "http://192.168.1.100:5000/download" // <-- Укажи свой IP и порт
-    
-    func downloadVideo(url: String, format: DownloadFormat, saveLocation: SaveLocation, completion: @escaping (Bool, String?) -> Void) {
-        guard isValidYouTubeURL(url) else {
-            downloadState = .failed(error: "Неверная ссылка на YouTube")
-            completion(false, "Неверная ссылка на YouTube")
+    private let serverURL = "http://192.168.1.100:5000/start_download" // <-- Исправлено на /start_download
+    func downloadVideo(service: VideoService, url: String, format: DownloadFormat, removeWatermark: Bool, saveLocation: SaveLocation, completion: @escaping (Bool, String?) -> Void) {
+        // Валидация ссылки
+        let isValidURL: Bool = {
+            switch service {
+            case .youtube: return isValidYouTubeURL(url)
+            case .tiktok: return isValidTikTokURL(url)
+            }
+        }()
+        guard isValidURL else {
+            downloadState = .failed(error: "Неверная ссылка на \(service.rawValue)")
+            completion(false, "Неверная ссылка на \(service.rawValue)")
             return
         }
         downloadState = .preparing
-        // Формируем запрос к серверу
-        let normalizedURL = normalizeYouTubeURL(url)
-        guard var components = URLComponents(string: serverURL) else {
+        guard let requestURL = URL(string: serverURL) else {
             downloadState = .failed(error: "Ошибка адреса сервера")
             completion(false, "Ошибка адреса сервера")
             return
         }
-        components.queryItems = [URLQueryItem(name: "url", value: normalizedURL)]
-        guard let requestURL = components.url else {
+        // Формируем JSON
+        let body: [String: Any] = [
+            "url": url,
+            "format": format.formatCode(service: service),
+            "remove_watermark": (service == .tiktok) ? removeWatermark : false
+        ]
+        guard let jsonData = try? JSONSerialization.data(withJSONObject: body) else {
             downloadState = .failed(error: "Ошибка формирования запроса")
             completion(false, "Ошибка формирования запроса")
             return
         }
+        var request = URLRequest(url: requestURL)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = jsonData
         downloadState = .downloading(progress: 0.0)
-        let task = URLSession.shared.downloadTask(with: requestURL) { tempURL, response, error in
-            if let tempURL, error == nil {
-                let fileName = UUID().uuidString + "." + format.fileExtension
-                let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-                let destinationURL = documentsPath.appendingPathComponent(fileName)
-                do {
-                    try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+        let task = URLSession.shared.dataTask(with: request) { data, response, error in
+            guard let data = data, error == nil,
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let taskId = json["task_id"] as? String else {
+                DispatchQueue.main.async {
+                    self.downloadState = .failed(error: "Ошибка запуска скачивания")
+                    completion(false, "Ошибка запуска скачивания")
+                }
+                return
+            }
+            // Ожидаем завершения задачи и скачиваем файл
+            self.pollStatusAndDownload(taskId: taskId, format: format, saveLocation: saveLocation, completion: completion)
+        }
+        task.resume()
+    }
+    
+    private func pollStatusAndDownload(taskId: String, format: DownloadFormat, saveLocation: SaveLocation, completion: @escaping (Bool, String?) -> Void) {
+        let statusURL = "http://192.168.1.100:5000/status/\(taskId)" // <-- Укажи свой IP и порт
+        let downloadURL = "http://192.168.1.100:5000/download/\(taskId)" // <-- Укажи свой IP и порт
+        
+        func pollStatus() {
+            guard let requestURL = URL(string: statusURL) else {
+                DispatchQueue.main.async {
+                    self.downloadState = .failed(error: "Ошибка адреса сервера для статуса")
+                    completion(false, "Ошибка адреса сервера для статуса")
+                }
+                return
+            }
+            var request = URLRequest(url: requestURL)
+            request.httpMethod = "GET"
+            request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            
+            let task = URLSession.shared.dataTask(with: request) { data, response, error in
+                if let error = error {
                     DispatchQueue.main.async {
-                        self.downloadedFileURL = destinationURL
+                        self.downloadState = .failed(error: "Ошибка получения статуса: \(error.localizedDescription)")
+                        completion(false, "Ошибка получения статуса: \(error.localizedDescription)")
+                    }
+                    return
+                }
+                
+                guard let data = data,
+                      let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let status = json["status"] as? String,
+                      let progress = json["progress"] as? Double,
+                      let fileURLString = json["file_url"] as? String else {
+                    DispatchQueue.main.async {
+                        self.downloadState = .failed(error: "Неверный формат ответа от сервера")
+                        completion(false, "Неверный формат ответа от сервера")
+                    }
+                    return
+                }
+                
+                DispatchQueue.main.async {
+                    self.downloadState = .downloading(progress: progress)
+                    
+                    if status == "completed" {
+                        self.downloadedFileURL = URL(string: fileURLString)
                         self.downloadState = .completed
                         if format.isVideo && saveLocation == .gallery {
-                            self.saveVideoToGallery(url: destinationURL) { success, error in
+                            self.saveVideoToGallery(url: self.downloadedFileURL!) { success, error in
                                 completion(success, error)
                             }
                         } else {
                             completion(true, nil)
                         }
+                    } else if status == "failed" {
+                        if let errorMessage = json["error"] as? String {
+                            self.downloadState = .failed(error: errorMessage)
+                            completion(false, errorMessage)
+                        } else {
+                            self.downloadState = .failed(error: "Неизвестная ошибка скачивания")
+                            completion(false, "Неизвестная ошибка скачивания")
+                        }
+                    } else {
+                        // Продолжаем опрос
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { // Опрос каждые 1 секунду
+                            pollStatus()
+                        }
                     }
-                } catch {
-                    DispatchQueue.main.async {
-                        self.downloadState = .failed(error: "Ошибка сохранения файла")
-                        completion(false, "Ошибка сохранения файла")
-                    }
-                }
-            } else {
-                DispatchQueue.main.async {
-                    self.downloadState = .failed(error: "Ошибка скачивания файла")
-                    completion(false, "Ошибка скачивания файла")
                 }
             }
+            task.resume()
         }
-        task.resume()
+        pollStatus()
     }
     
     private func normalizeYouTubeURL(_ url: String) -> String {
@@ -141,6 +213,19 @@ class DownloadManager: ObservableObject {
         return false
     }
     
+    private func isValidTikTokURL(_ url: String) -> Bool {
+        let tiktokPatterns = [
+            "^https?://(?:www\\.)?tiktok\\.com/.+",
+            "^https?://(?:www\\.)?vm\\.tiktok\\.com/.+"
+        ]
+        for pattern in tiktokPatterns {
+            if url.range(of: pattern, options: .regularExpression) != nil {
+                return true
+            }
+        }
+        return false
+    }
+    
     private func extractVideoId(from url: String) -> String {
         let patterns = [
             "(?:youtube\\.com/watch\\?v=|youtu\\.be/|youtube\\.com/embed/)([a-zA-Z0-9_-]{11})"
@@ -162,10 +247,36 @@ class DownloadManager: ObservableObject {
     }
 }
 
+extension DownloadFormat {
+    func formatCode(service: VideoService) -> String {
+        switch service {
+        case .youtube:
+            switch self {
+            case .mp4_1080p: return "bestvideo[height<=1080]+bestaudio/best[height<=1080]"
+            case .mp4_720p: return "bestvideo[height<=720]+bestaudio/best[height<=720]"
+            case .mp4_480p: return "bestvideo[height<=480]+bestaudio/best[height<=480]"
+            case .mp3_320: return "bestaudio[abr<=320]/bestaudio/best"
+            case .mp3_256: return "bestaudio[abr<=256]/bestaudio/best"
+            case .mp3_128: return "bestaudio[abr<=128]/bestaudio/best"
+            }
+        case .tiktok:
+            // TikTok поддерживает только mp4, качество можно ограничить по height
+            switch self {
+            case .mp4_1080p: return "best[height<=1080]"
+            case .mp4_720p: return "best[height<=720]"
+            case .mp4_480p: return "best[height<=480]"
+            default: return "best"
+            }
+        }
+    }
+}
+
 // MARK: - Main Content View
 struct ContentView: View {
     @StateObject private var downloadManager = DownloadManager()
+    @State private var selectedService: VideoService = .youtube
     @State private var youtubeURL: String = ""
+    @State private var tiktokURL: String = ""
     @State private var showFormatSheet = false
     @State private var selectedFormat: DownloadFormat = .mp4_720p
     @State private var showSaveLocationSheet = false
@@ -175,14 +286,24 @@ struct ContentView: View {
     @State private var showSuccess = false
     @State private var showDocumentPicker = false
     @State private var fileToShare: URL?
-    
+    @State private var removeWatermark: Bool = true
     var body: some View {
         ZStack {
             LinearGradient(gradient: Gradient(colors: [Color(.systemGray6), Color(.systemGray4)]), startPoint: .top, endPoint: .bottom)
                 .ignoresSafeArea()
             VStack(spacing: 32) {
                 headerView
+                Picker("Сервис", selection: $selectedService) {
+                    ForEach(VideoService.allCases) { service in
+                        Text(service.rawValue).tag(service)
+                    }
+                }
+                .pickerStyle(SegmentedPickerStyle())
                 urlInputSection
+                if selectedService == .tiktok {
+                    Toggle("Убрать водяной знак", isOn: $removeWatermark)
+                        .padding(.horizontal)
+                }
                 downloadButton
                 downloadSection
                 Spacer()
@@ -234,25 +355,48 @@ struct ContentView: View {
     
     private var urlInputSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Ссылка на YouTube видео")
-                .font(.headline)
-            HStack {
-                TextField("https://youtube.com/watch?v=...", text: $youtubeURL)
-                    .textFieldStyle(.roundedBorder)
-                    .keyboardType(.URL)
-                    .autocapitalization(.none)
-                    .disableAutocorrection(true)
-                if !youtubeURL.isEmpty {
-                    Button(action: { youtubeURL = "" }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .foregroundColor(.gray)
+            if selectedService == .youtube {
+                Text("Ссылка на YouTube видео")
+                    .font(.headline)
+                HStack {
+                    TextField("https://youtube.com/watch?v=...", text: $youtubeURL)
+                        .textFieldStyle(.roundedBorder)
+                        .keyboardType(.URL)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                    if !youtubeURL.isEmpty {
+                        Button(action: { youtubeURL = "" }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.gray)
+                        }
                     }
                 }
-            }
-            if !youtubeURL.isEmpty && !isValidYouTubeURL(youtubeURL) {
-                Text("Пожалуйста, введите корректную ссылку на YouTube")
-                    .font(.caption)
-                    .foregroundColor(.red)
+                if !youtubeURL.isEmpty && !downloadManager.isValidYouTubeURL(youtubeURL) {
+                    Text("Пожалуйста, введите корректную ссылку на YouTube")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
+            } else {
+                Text("Ссылка на TikTok видео")
+                    .font(.headline)
+                HStack {
+                    TextField("https://tiktok.com/...", text: $tiktokURL)
+                        .textFieldStyle(.roundedBorder)
+                        .keyboardType(.URL)
+                        .autocapitalization(.none)
+                        .disableAutocorrection(true)
+                    if !tiktokURL.isEmpty {
+                        Button(action: { tiktokURL = "" }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundColor(.gray)
+                        }
+                    }
+                }
+                if !tiktokURL.isEmpty && !downloadManager.isValidTikTokURL(tiktokURL) {
+                    Text("Пожалуйста, введите корректную ссылку на TikTok")
+                        .font(.caption)
+                        .foregroundColor(.red)
+                }
             }
         }
     }
@@ -262,7 +406,7 @@ struct ContentView: View {
             if canDownload {
                 showFormatSheet = true
             } else {
-                alertMessage = "Введите корректную ссылку на YouTube"
+                alertMessage = "Введите корректную ссылку на \(selectedService.rawValue)"
                 showAlert = true
             }
         }) {
@@ -375,30 +519,18 @@ struct ContentView: View {
     }
     
     private var canDownload: Bool {
-        !youtubeURL.isEmpty && isValidYouTubeURL(youtubeURL)
+        switch selectedService {
+        case .youtube:
+            return !youtubeURL.isEmpty && downloadManager.isValidYouTubeURL(youtubeURL)
+        case .tiktok:
+            return !tiktokURL.isEmpty && downloadManager.isValidTikTokURL(tiktokURL)
+        }
     }
     
     private func startDownload() {
-        if selectedFormat.isVideo && selectedSaveLocation == .gallery {
-            PHPhotoLibrary.requestAuthorization { status in
-                DispatchQueue.main.async {
-                    if status == .authorized {
-                        downloadManager.downloadVideo(url: youtubeURL, format: selectedFormat, saveLocation: selectedSaveLocation) { success, error in
-                            if success {
-                                showSuccess = true
-                            } else {
-                                alertMessage = error ?? "Ошибка сохранения"
-                                showAlert = true
-                            }
-                        }
-                    } else {
-                        alertMessage = "Для сохранения видео в галерею необходимо разрешение на доступ к фото"
-                        showAlert = true
-                    }
-                }
-            }
-        } else {
-            downloadManager.downloadVideo(url: youtubeURL, format: selectedFormat, saveLocation: selectedSaveLocation) { success, error in
+        let url = selectedService == .youtube ? youtubeURL : tiktokURL
+        downloadManager.downloadVideo(service: selectedService, url: url, format: selectedFormat, removeWatermark: removeWatermark, saveLocation: selectedSaveLocation) { success, error in
+            DispatchQueue.main.async {
                 if success {
                     showSuccess = true
                 } else {
