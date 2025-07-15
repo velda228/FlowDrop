@@ -19,17 +19,27 @@ DOWNLOAD_DIR = '/tmp/ytviewer_downloads'
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
 # Фоновая функция скачивания
-def download_worker(task_id, url):
+def download_worker(task_id, url, format_code=None, remove_watermark=False):
     tasks[task_id]['status'] = 'downloading'
     outtmpl = os.path.join(DOWNLOAD_DIR, f"{task_id}.%(ext)s")
     ydl_opts = {
         'outtmpl': outtmpl,
-        'format': 'bestvideo+bestaudio/best',
         'merge_output_format': 'mp4',
         'quiet': True,
     }
+    # Формат (качество)
+    if format_code:
+        ydl_opts['format'] = format_code
+    else:
+        ydl_opts['format'] = 'bestvideo+bestaudio/best'
     if PROXY:
         ydl_opts['proxy'] = PROXY
+    # Удаление водяного знака для TikTok
+    extractor_args = {}
+    if remove_watermark and ('tiktok.com' in url or 'douyin.com' in url):
+        extractor_args['tiktok'] = {'remove_watermark': '1'}
+    if extractor_args:
+        ydl_opts['extractor_args'] = extractor_args
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -46,11 +56,13 @@ def download_worker(task_id, url):
 def start_download():
     data = request.get_json()
     url = data.get('url')
+    format_code = data.get('format')
+    remove_watermark = data.get('remove_watermark', False)
     if not url:
         return jsonify({'error': 'No URL'}), 400
     task_id = str(uuid.uuid4())
     tasks[task_id] = {'status': 'pending', 'file': None, 'error': None}
-    threading.Thread(target=download_worker, args=(task_id, url), daemon=True).start()
+    threading.Thread(target=download_worker, args=(task_id, url, format_code, remove_watermark), daemon=True).start()
     return jsonify({'task_id': task_id})
 
 @app.route('/status/<task_id>', methods=['GET'])
